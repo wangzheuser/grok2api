@@ -101,7 +101,7 @@ var providerFixedReasoningModels = map[account.Provider]map[string]struct{}{
 // Effort-suffixed aliases (e.g. grok-4.5-low) inherit the base model's levels.
 func SupportedReasoningEfforts(publicModel string) []string {
 	providerValue, slug := splitProviderModel(publicModel)
-	if base, _, ok := parseReasoningModelAliasSlug(slug); ok {
+	if base, _, ok := parseReasoningModelAliasSlug(slug, providerValue); ok {
 		slug = base
 	}
 	if providerValue != "" {
@@ -115,7 +115,7 @@ func SupportedReasoningEfforts(publicModel string) []string {
 // reason intrinsically but does not expose a configurable effort parameter.
 func SupportedReasoningEffortsForProvider(providerValue account.Provider, publicModel string) []string {
 	slug := externalModelSlug(publicModel)
-	if base, _, ok := parseReasoningModelAliasSlug(slug); ok {
+	if base, _, ok := parseReasoningModelAliasSlug(slug, providerValue); ok {
 		slug = base
 	}
 	return supportedReasoningEffortsForProviderSlug(providerValue, slug)
@@ -127,7 +127,10 @@ func supportedReasoningEffortsForProviderSlug(providerValue account.Provider, sl
 			return append([]string(nil), levels...)
 		}
 	}
-	return reasoningEffortsForSlug(slug)
+	if providerValue == "" || providerValue == account.ProviderBuild {
+		return reasoningEffortsForSlug(slug)
+	}
+	return staticReasoningEffortsForSlug(slug)
 }
 
 // SupportsReasoningEffort reports whether publicModel accepts the given effort level.
@@ -185,7 +188,8 @@ func DefaultReasoningEffort(publicModel string) string {
 	if _, effort, ok := ParseReasoningModelAlias(publicModel); ok {
 		return effort
 	}
-	return preferredReasoningEffort(externalModelSlug(publicModel), SupportedReasoningEfforts(publicModel))
+	providerValue, slug := splitProviderModel(publicModel)
+	return preferredReasoningEffort(slug, SupportedReasoningEfforts(publicModel), providerValue == "" || providerValue == account.ProviderBuild)
 }
 
 // DefaultReasoningEffortForProvider returns a configurable Provider default.
@@ -194,13 +198,17 @@ func DefaultReasoningEffortForProvider(providerValue account.Provider, publicMod
 	if _, effort, ok := ParseReasoningModelAlias(publicModel); ok && SupportsReasoningEffortForProvider(providerValue, publicModel, effort) {
 		return effort
 	}
-	return preferredReasoningEffort(externalModelSlug(publicModel), SupportedReasoningEffortsForProvider(providerValue, publicModel))
+	return preferredReasoningEffort(externalModelSlug(publicModel), SupportedReasoningEffortsForProvider(providerValue, publicModel), providerValue == account.ProviderBuild)
 }
 
 func reasoningEffortsForSlug(slug string) []string {
 	if profile, ok := UpstreamProfile(slug); ok && len(profile.ReasoningEfforts) > 0 {
 		return append([]string(nil), profile.ReasoningEfforts...)
 	}
+	return staticReasoningEffortsForSlug(slug)
+}
+
+func staticReasoningEffortsForSlug(slug string) []string {
 	if levels, ok := grokReasoningCapabilities[slug]; ok {
 		return append([]string(nil), levels...)
 	}
@@ -209,8 +217,8 @@ func reasoningEffortsForSlug(slug string) []string {
 
 // preferredReasoningEffort picks the default among levels: the catalog-declared
 // default when the live menu provides one, otherwise medium, otherwise the first level.
-func preferredReasoningEffort(slug string, levels []string) string {
-	if profile, ok := UpstreamProfile(slug); ok && profile.DefaultReasoningEffort != "" && levelsContain(levels, profile.DefaultReasoningEffort) {
+func preferredReasoningEffort(slug string, levels []string, useBuildProfile bool) string {
+	if profile, ok := UpstreamProfile(slug); useBuildProfile && ok && profile.DefaultReasoningEffort != "" && levelsContain(levels, profile.DefaultReasoningEffort) {
 		return profile.DefaultReasoningEffort
 	}
 	for _, level := range levels {
@@ -282,7 +290,8 @@ func ParseReasoningModelAlias(publicModel string) (baseModel, effort string, ok 
 			break
 		}
 	}
-	baseLocal, effort, ok := parseReasoningModelAliasSlug(local)
+	providerValue, _ := splitProviderModel(name)
+	baseLocal, effort, ok := parseReasoningModelAliasSlug(local, providerValue)
 	if !ok {
 		return "", "", false
 	}
@@ -291,7 +300,7 @@ func ParseReasoningModelAlias(publicModel string) (baseModel, effort string, ok 
 
 // parseReasoningModelAliasSlug parses an unprefixed model slug only.
 // It looks up capabilities directly to avoid recursion with SupportedReasoningEfforts.
-func parseReasoningModelAliasSlug(slug string) (base, effort string, ok bool) {
+func parseReasoningModelAliasSlug(slug string, providerValue account.Provider) (base, effort string, ok bool) {
 	name := strings.TrimSpace(slug)
 	if name == "" {
 		return "", "", false
@@ -311,6 +320,9 @@ func parseReasoningModelAliasSlug(slug string) (base, effort string, ok bool) {
 		// Aliases only exist when the base model has multiple controllable levels;
 		// single-level models (e.g. grok-build-0.1 → none only) keep the base name.
 		levels := reasoningEffortsForSlug(base)
+		if providerValue != "" && providerValue != account.ProviderBuild {
+			levels = staticReasoningEffortsForSlug(base)
+		}
 		if len(levels) < 2 || !levelsContain(levels, level) {
 			continue
 		}

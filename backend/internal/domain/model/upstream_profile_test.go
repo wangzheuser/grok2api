@@ -92,3 +92,34 @@ func TestGrok47StaticCapabilities(t *testing.T) {
 		t.Fatalf("grok-4.7 efforts = %v", got)
 	}
 }
+
+func TestBuildProfileDoesNotOverrideOtherProviders(t *testing.T) {
+	ResetUpstreamProfiles()
+	t.Cleanup(ResetUpstreamProfiles)
+	RegisterUpstreamModelProfile("grok-4.6", UpstreamModelProfile{
+		ReasoningEfforts: []string{"minimal", "high", "max"}, DefaultReasoningEffort: "max",
+	})
+	for _, provider := range []account.Provider{account.ProviderWeb, account.ProviderConsole} {
+		want := []string{ReasoningEffortLow, ReasoningEffortMedium, ReasoningEffortHigh, ReasoningEffortXHigh}
+		if got := SupportedReasoningEffortsForProvider(provider, "grok-4.6"); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s efforts = %v, want %v", provider, got, want)
+		}
+		for _, name := range []string{"grok-4.6", provider.ModelNamespace() + "/grok-4.6"} {
+			if got := DefaultReasoningEffortForProvider(provider, name); got != ReasoningEffortMedium {
+				t.Errorf("%s default = %q", provider, got)
+			}
+		}
+		if got := DefaultReasoningEffort(provider.ModelNamespace() + "/grok-4.6"); got != ReasoningEffortMedium {
+			t.Errorf("%s prefixed default = %q", provider, got)
+		}
+		if _, effort, ok := ParseReasoningModelAlias(provider.ModelNamespace() + "/grok-4.6-xhigh"); !ok || effort != ReasoningEffortXHigh {
+			t.Errorf("%s static xhigh alias disappeared", provider)
+		}
+		if _, _, ok := ParseReasoningModelAlias(provider.ModelNamespace() + "/grok-4.6-minimal"); ok {
+			t.Errorf("%s advertised Build-only minimal alias", provider)
+		}
+	}
+	if got := DefaultReasoningEffortForProvider(account.ProviderBuild, "grok-4.6"); got != ReasoningEffortMax {
+		t.Fatalf("Build default = %q", got)
+	}
+}

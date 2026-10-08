@@ -68,9 +68,9 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 		want QualityVerdict
 	}{
 		{
-			name: "hold-expired hello dump withholds",
+			name: "hold-expired incomplete hello waits",
 			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 2, ReasoningTokens: 954, EncryptedBytes: 4000, EncryptedFloor: 3816, HoldExpired: true},
-			want: QualityWithhold,
+			want: QualityWait,
 		},
 		{
 			name: "hold-expired long answer still waiting without flush",
@@ -84,27 +84,27 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 		},
 		{
 			name: "barely-over-floor flush withholds",
-			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 50, ReasoningTokens: 60, EncryptedBytes: 300, EncryptedFloor: 256, FirstVisible: true, VisibleFlushMS: 100},
+			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 50, ReasoningTokens: 60, EncryptedBytes: 300, EncryptedFloor: 256, FirstVisible: true, VisibleFlushMS: 100, Terminal: true},
 			want: QualityWithhold,
 		},
 		{
 			name: "large cipher flush without plaintext withholds",
-			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 50, ReasoningTokens: 60, EncryptedBytes: 2000, EncryptedFloor: 256, FirstVisible: true, VisibleFlushMS: 100},
+			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 50, ReasoningTokens: 60, EncryptedBytes: 2000, EncryptedFloor: 256, FirstVisible: true, VisibleFlushMS: 100, Terminal: true},
 			want: QualityWithhold,
 		},
 		{
 			name: "floor-met short visible fast dump withholds",
-			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 3, ReasoningTokens: 1371, EncryptedBytes: 8000, EncryptedFloor: 5484, FirstVisible: true, VisibleFlushMS: 200},
+			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 3, ReasoningTokens: 1371, EncryptedBytes: 8000, EncryptedFloor: 5484, FirstVisible: true, VisibleFlushMS: 200, Terminal: true},
 			want: QualityWithhold,
 		},
 		{
 			name: "floor-met 8 visible 140 reasoning in under 1s withholds",
-			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 8, ReasoningTokens: 140, EncryptedBytes: 2000, EncryptedFloor: 560, FirstVisible: true, VisibleFlushMS: 660},
+			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 8, ReasoningTokens: 140, EncryptedBytes: 2000, EncryptedFloor: 560, FirstVisible: true, VisibleFlushMS: 660, Terminal: true},
 			want: QualityWithhold,
 		},
 		{
 			name: "floor-met long visible fast flush withholds",
-			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 80, ReasoningTokens: 140, EncryptedBytes: 2000, EncryptedFloor: 560, FirstVisible: true, VisibleFlushMS: 200},
+			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 80, ReasoningTokens: 140, EncryptedBytes: 2000, EncryptedFloor: 560, FirstVisible: true, VisibleFlushMS: 200, Terminal: true},
 			want: QualityWithhold,
 		},
 		{
@@ -148,9 +148,9 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 			want: QualityWait,
 		},
 		{
-			name: "cipher stub hold-expired 1024 visible withholds",
+			name: "cipher stub hold-expired incomplete 1024 visible waits",
 			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 1024, ReasoningTokens: 0, EncryptedBytes: 400, HoldExpired: true},
-			want: QualityWithhold,
+			want: QualityWait,
 		},
 		{
 			name: "plaintext thinking with visible still delivers",
@@ -168,9 +168,9 @@ func TestClassifyQualityHoldBurst(t *testing.T) {
 			want: QualityWithhold,
 		},
 		{
-			name: "cipher-only mid dump withholds",
+			name: "cipher-only mid stream waits",
 			sig:  QualityStreamSignals{HasThinking: true, VisibleTokens: 50, ReasoningTokens: 1730, EncryptedBytes: 8000, EncryptedFloor: 6920, FirstVisible: true, VisibleFlushMS: 50},
-			want: QualityWithhold,
+			want: QualityWait,
 		},
 		{
 			name: "usage-only vis7 heavy reasoning 1ms flush withholds",
@@ -750,6 +750,26 @@ func TestObserveQualityChunkEmptyReasoningStubIsNotThinking(t *testing.T) {
 	}
 }
 
+func TestClassifyQualityHoldWaitsForCipherStreamEvidence(t *testing.T) {
+	t.Parallel()
+	sig := QualityStreamSignals{HasThinking: true, EncryptedBytes: 8000, EncryptedFloor: 256,
+		FirstVisible: true, VisibleTokens: 1, VisibleFlushMS: 0}
+	if got := ClassifyQualityHold(sig, 8); got != QualityWait {
+		t.Fatalf("first visible fragment = %s, want wait", got)
+	}
+	sig.VisibleTokens = 1200
+	sig.VisibleFlushMS = 2500
+	if got := ClassifyQualityHold(sig, 8); got != QualityDeliver {
+		t.Fatalf("streamed answer before terminal usage = %s, want deliver", got)
+	}
+	sig.VisibleTokens = 1
+	sig.VisibleFlushMS = 10
+	sig.Terminal = true
+	if got := ClassifyQualityHold(sig, 8); got != QualityWithhold {
+		t.Fatalf("completed fast dump = %s, want withhold", got)
+	}
+}
+
 func TestPeekQualityStreamThinkingDeliversRemainder(t *testing.T) {
 	t.Parallel()
 	body := io.NopCloser(strings.NewReader(sse(
@@ -820,16 +840,66 @@ func TestPeekQualityStreamCipherBurstWaitsAcrossEventSplits(t *testing.T) {
 	}
 	select {
 	case result := <-done:
+		_ = result.replay.Close()
+		t.Fatalf("first visible fragment returned early: verdict=%s err=%v", result.verdict, result.err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	if _, err := io.WriteString(writer, completed); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
 		if result.replay != nil {
 			_ = result.replay.Close()
 		}
 		if result.err != nil || result.verdict != QualityWithhold {
-			t.Fatalf("visible dump must withhold without waiting for completed: verdict=%s err=%v", result.verdict, result.err)
+			t.Fatalf("completed dump must withhold: verdict=%s err=%v", result.verdict, result.err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("split visible dump did not withhold")
 	}
 	_ = writer.Close()
+}
+
+func TestPeekQualityStreamCipherAnswerStreamsNormally(t *testing.T) {
+	t.Parallel()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	done := make(chan QualityVerdict, 1)
+	go func() {
+		replay, verdict, _, _, err := peekQualityStream(context.Background(), reader, qualityProtocolResponses,
+			QualityRetryRuntime{MinOutputTokens: 8, HoldTimeout: time.Second})
+		defer replay.Close()
+		if err != nil {
+			t.Errorf("peek: %v", err)
+		}
+		done <- verdict
+		_, _ = io.Copy(io.Discard, replay)
+	}()
+	first := sse(
+		`data: {"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"`+strings.Repeat("A", 8000)+`"}}`,
+		`data: {"type":"response.output_text.delta","delta":"first fragment"}`,
+	)
+	if _, err := io.WriteString(writer, first); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case verdict := <-done:
+		t.Fatalf("normal cipher stream rejected at first fragment: %s", verdict)
+	case <-time.After(2100 * time.Millisecond):
+	}
+	if _, err := io.WriteString(writer, sse(`data: {"type":"response.output_text.delta","delta":"`+strings.Repeat("answer ", 700)+`"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case verdict := <-done:
+		if verdict != QualityDeliver {
+			t.Fatalf("normal streamed answer = %s", verdict)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("normal streamed answer remained held")
+	}
 }
 
 func TestPeekQualityStreamWithholdsNoThinkEnough(t *testing.T) {
