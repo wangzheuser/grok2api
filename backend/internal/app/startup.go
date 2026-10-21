@@ -11,6 +11,7 @@ import (
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	webprovider "github.com/chenyme/grok2api/backend/internal/infra/provider/web"
 	"github.com/chenyme/grok2api/backend/internal/repository"
 	httpserver "github.com/chenyme/grok2api/backend/internal/transport/http"
 )
@@ -180,13 +181,45 @@ func readinessSnapshot(
 	required := make(map[accountdomain.Provider]bool, 3)
 	usable := make(map[accountdomain.Provider]bool, 3)
 	providerErrors := make(map[accountdomain.Provider]bool, 3)
+	// Base eligibility is shared by quota mode. An exhausted pool does not
+	// need the same thousands of accounts reloaded for every model route.
+	type poolKey struct {
+		provider  accountdomain.Provider
+		quotaMode string
+	}
+	poolUsable := make(map[poolKey]bool)
+	layers, layered := accounts.(repository.RoutingLayerRepository)
 	now := time.Now().UTC()
 	for _, route := range routes {
 		required[route.Provider] = true
 		if usable[route.Provider] || route.SupportedAccounts == 0 {
 			continue
 		}
-		candidates, listErr := accounts.ListRoutingCandidates(ctx, route.Provider, route.ID, route.UpstreamModel, providers.QuotaMode(route.Provider, route.UpstreamModel))
+		quotaMode := providers.QuotaMode(route.Provider, route.UpstreamModel)
+		key := poolKey{route.Provider, quotaMode}
+		if layered {
+			if _, checked := poolUsable[key]; !checked {
+				bases, baseErr := layers.ListRoutingAccountBases(ctx, route.Provider, quotaMode)
+				if baseErr != nil {
+					providerErrors[route.Provider] = true
+					continue
+				}
+				poolUsable[key] = false
+				for _, base := range bases {
+					if startupCandidateUsable(accountdomain.RoutingCandidate{
+						Credential: base.Credential, Billing: base.Billing,
+						QuotaRecovery: base.QuotaRecovery, QuotaWindow: base.QuotaWindow,
+					}, now, providers) {
+						poolUsable[key] = true
+						break
+					}
+				}
+			}
+			if !poolUsable[key] {
+				continue
+			}
+		}
+		candidates, listErr := accounts.ListRoutingCandidates(ctx, route.Provider, route.ID, route.UpstreamModel, quotaMode)
 		if listErr != nil {
 			providerErrors[route.Provider] = true
 			continue
@@ -372,7 +405,11 @@ func (a *Application) runStatsigWarmup(ctx context.Context) {
 		}
 		if err != nil && ctx.Err() == nil {
 			a.logger.Warn("web_statsig_warmup_failed", "error", err)
-			a.startup.setStatsig("unavailable", "预热失败，将由请求按需重试", 0)
+			detail := "预热失败，将由请求按需重试"
+			if errors.Is(err, webprovider.ErrStatsigMetaMissing) {
+				detail = "上游页面缺少 grok-site-verification；5 分钟内跳过重复抓取，未生成签名"
+			}
+			a.startup.setStatsig("unavailable", detail, 0)
 		}
 		resetTimer(timer, statsigWarmupInterval)
 	}

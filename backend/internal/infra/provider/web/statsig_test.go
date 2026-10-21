@@ -72,7 +72,7 @@ func TestFetchStatsigMetaContentDoesNotFallbackWhenSuccessfulIndexHasNoVerificat
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`<html><head></head></html>`)), Header: http.Header{}}, nil
 	}
 	_, err := fetchStatsigMetaContentWithDo(context.Background(), "https://grok.com", "sso-token", &infraegress.Lease{UserAgent: "test-agent"}, do)
-	if !errors.Is(err, errStatsigMetaMissing) {
+	if !errors.Is(err, ErrStatsigMetaMissing) {
 		t.Fatalf("err=%v", err)
 	}
 	if len(paths) != 1 || paths[0] != "/index" {
@@ -142,7 +142,7 @@ func TestFetchStatsigMetaContentRequiresVerificationOnSuccessfulRoot(t *testing.
 		}, nil
 	}
 	_, err := fetchStatsigMetaContentWithDo(context.Background(), "https://grok.com", "sso-token", &infraegress.Lease{UserAgent: "test-agent"}, do)
-	if !errors.Is(err, errStatsigMetaMissing) {
+	if !errors.Is(err, ErrStatsigMetaMissing) {
 		t.Fatalf("err=%v", err)
 	}
 }

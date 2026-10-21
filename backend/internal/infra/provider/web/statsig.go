@@ -28,9 +28,11 @@ const (
 	statsigCacheMaxEntries  = 4096
 	statsigMetaBodyLimit    = 4 << 20
 	statsigResponseLimit    = 4 << 10
+	statsigMissingMetaRetry = 5 * time.Minute
 )
 
-var errStatsigMetaMissing = errors.New("Grok index 缺少 grok-site-verification")
+// ErrStatsigMetaMissing distinguishes an upstream page change from transport failures.
+var ErrStatsigMetaMissing = errors.New("Grok 页面缺少 grok-site-verification")
 
 type statsigCacheEntry struct {
 	value     string
@@ -48,13 +50,15 @@ type statsigWarmTarget struct {
 }
 
 type statsigSigner struct {
-	client           *http.Client
-	fetchMeta        func(context.Context, string, string, *infraegress.Lease) (string, error)
-	validateEndpoint func(context.Context, string) error
-	now              func() time.Time
-	mu               sync.Mutex
-	entries          map[string]statsigCacheEntry
-	refreshes        singleflight.Group
+	client            *http.Client
+	fetchMeta         func(context.Context, string, string, *infraegress.Lease) (string, error)
+	validateEndpoint  func(context.Context, string) error
+	now               func() time.Time
+	mu                sync.Mutex
+	entries           map[string]statsigCacheEntry
+	refreshes         singleflight.Group
+	missingMetaOrigin string
+	missingMetaUntil  time.Time
 }
 
 func newStatsigSigner() *statsigSigner {
@@ -122,7 +126,7 @@ func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token stri
 	if len(pending) == 0 {
 		return 0, nil
 	}
-	meta, err := s.fetchMeta(ctx, baseURL, token, lease)
+	meta, err := s.loadMeta(ctx, baseURL, token, lease)
 	if err != nil {
 		return 0, err
 	}
@@ -138,8 +142,32 @@ func (s *statsigSigner) Warm(ctx context.Context, baseURL, signerURL, token stri
 	return warmed, nil
 }
 
+// loadMeta shares discovery across signature paths and backs off only on a
+// confirmed missing meta, not an account/proxy-specific 403 or network error.
+func (s *statsigSigner) loadMeta(ctx context.Context, baseURL, token string, lease *infraegress.Lease) (string, error) {
+	value, err, _ := s.refreshes.Do("meta\x00"+baseURL, func() (any, error) {
+		s.mu.Lock()
+		missing := s.missingMetaOrigin == baseURL && s.now().Before(s.missingMetaUntil)
+		s.mu.Unlock()
+		if missing {
+			return "", ErrStatsigMetaMissing
+		}
+		meta, fetchErr := s.fetchMeta(ctx, baseURL, token, lease)
+		if errors.Is(fetchErr, ErrStatsigMetaMissing) {
+			s.mu.Lock()
+			s.missingMetaOrigin, s.missingMetaUntil = baseURL, s.now().Add(statsigMissingMetaRetry)
+			s.mu.Unlock()
+		}
+		return meta, fetchErr
+	})
+	if err != nil {
+		return "", err
+	}
+	return value.(string), nil
+}
+
 func (s *statsigSigner) freshSignature(ctx context.Context, baseURL, signerURL, token string, lease *infraegress.Lease, method, path string) (string, error) {
-	meta, err := s.fetchMeta(ctx, baseURL, token, lease)
+	meta, err := s.loadMeta(ctx, baseURL, token, lease)
 	if err != nil {
 		return "", err
 	}
@@ -148,7 +176,7 @@ func (s *statsigSigner) freshSignature(ctx context.Context, baseURL, signerURL, 
 		return signature, nil
 	}
 
-	meta, refreshErr := s.fetchMeta(ctx, baseURL, token, lease)
+	meta, refreshErr := s.loadMeta(ctx, baseURL, token, lease)
 	if refreshErr != nil {
 		return "", fmt.Errorf("刷新 Statsig metaContent: %w", refreshErr)
 	}
@@ -172,6 +200,7 @@ func (s *statsigSigner) Invalidate(baseURL, signerURL, method, target string) {
 func (s *statsigSigner) Clear() {
 	s.mu.Lock()
 	clear(s.entries)
+	s.missingMetaOrigin, s.missingMetaUntil = "", time.Time{}
 	s.mu.Unlock()
 }
 
@@ -296,7 +325,7 @@ func fetchStatsigMetaContentWithDo(ctx context.Context, baseURL, token string, l
 	}
 	if content, extractErr := extractStatsigMetaContent(index.body); extractErr == nil {
 		return content, nil
-	} else if !errors.Is(extractErr, errStatsigMetaMissing) {
+	} else if !errors.Is(extractErr, ErrStatsigMetaMissing) {
 		return "", extractErr
 	}
 
@@ -372,7 +401,7 @@ func extractStatsigMetaContent(body []byte) (string, error) {
 		switch tokenizer.Next() {
 		case html.ErrorToken:
 			if tokenizer.Err() == io.EOF {
-				return "", errStatsigMetaMissing
+				return "", ErrStatsigMetaMissing
 			}
 			return "", tokenizer.Err()
 		case html.StartTagToken, html.SelfClosingTagToken:
@@ -443,7 +472,11 @@ func (a *Adapter) applySignedStatsig(ctx context.Context, request *http.Request,
 		}
 		return
 	}
-	a.log().Warn("web_statsig_fetch_failed", "method", request.Method, "path", request.URL.EscapedPath(), "error", err)
+	// The warmup reports missing metadata once; do not log the same failure
+	// for every quota refresh while the shared backoff is active.
+	if !errors.Is(err, ErrStatsigMetaMissing) {
+		a.log().Warn("web_statsig_fetch_failed", "method", request.Method, "path", request.URL.EscapedPath(), "error", err)
+	}
 }
 
 // WarmStatsig 只使用一个 Web 账号和一个出口租约预热共享签名，不会逐账号访问上游。

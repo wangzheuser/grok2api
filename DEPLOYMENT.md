@@ -5,7 +5,7 @@
 - 配置检查：`scripts/deploy-grok2api-official.sh config -q`
 - 状态查询：`scripts/deploy-grok2api-official.sh ps`
 - 发布：准备并验证固定本地镜像后，仅修改 `docker-compose.yml` 中 `services.grok2api.image`，执行 `scripts/deploy-grok2api-official.sh up -d --no-deps --pull never grok2api`。
-- 回滚：执行对应备份目录中的 `ROLLBACK.sh`；它恢复原 Compose 镜像和原 Build 客户端设置，重建目标服务，并检查健康。不要恢复整库覆盖发布后业务数据。
+- 回滚：执行对应备份目录中的 `ROLLBACK.sh`；它恢复本次变更的 Compose 镜像，重建目标服务，并检查健康。不要恢复整库覆盖发布后业务数据。
 
 入口使用 `--env-file /opt/docker_projects/grok2api/.env -f /opt/docker_projects/grok2api/docker-compose.yml`。环境和配置秘密仅保存在服务器受限文件中。
 
@@ -29,6 +29,15 @@
 服务器恢复材料和检查记录保存在项目目录外 `/opt/backups/grok2api-20261021-upstream/`，目录权限 `0700`；配置和 SQLite 原生一致性备份权限 `0600`。保留上一版本镜像。回滚只恢复本次改变的 Compose 镜像，不用发布前整库覆盖后续业务写入。
 
 验收包含后端测试、前端构建与测试、部署前后 API 认证边界和真实 Build/Web/Console SSE、公共 TLS 页面及静态资源、数据库完整性、挂载身份和其他容器 ID/StartedAt/RestartCount。上游失败与程序回归分别记录；健康状态不代替推理成功。
+
+## 长推理与分层就绪检查
+
+- 文本流在等待选路、上游响应头或质量检查时，每 15 秒发送 SSE 注释；取得上游流后只在完整事件之间补充注释。注释不计入首 token、用量或上游有效生成活动，原有质量门禁与上游空闲超时保持不变。
+- 首个心跳前仍可返回原 HTTP 错误状态；心跳提交 HTTP 200 后，失败通过对应协议的终止错误事件返回。调用方必须检查终止事件，不能仅按 HTTP 200 判断成功。
+- 不通过增大共享 Nginx 超时掩盖长时间无响应。2026-10-21 的发布前探测中，直连请求在 183 秒完成，公网另一请求在 60 秒被入口切断；回归需同时记录响应头时间、心跳、完整答案和审计。
+- `readyz` 每次重新检查真实账号状态，但按 Provider/额度模式复用基础资格检查，避免额度耗尽时逐模型重复扫描全池。Console 额度不足仍如实显示不可用，不自动关闭路由。
+- Statsig 的 `/index` 和 `/` 页面已实测缺少 `grok-site-verification`。仅对明确的元数据缺失共享 5 分钟退避；网络或代理 403 不污染共享退避，配置更新会清除退避。状态明确显示未生成签名，不伪造签名或把该依赖标为已预热；Web 保留既有按需回退行为。
+- 本次恢复材料位于 `/opt/backups/grok2api-20261021-readiness/`，上一批备份不覆盖。只发布 `dev`，`main` 不变。
 
 ## 历史待整改与例外
 

@@ -414,7 +414,7 @@ func TestDirectUpstreamCredentialResponsesAreRewritten(t *testing.T) {
 				case tc.media:
 					handler.writeMediaResult(c, result)
 				case tc.anthropic:
-					handler.writeAnthropicResult(c, result, false)
+					handler.writeProtocolResult(c, result, false, true, streamProtocolAnthropic, "")
 				default:
 					handler.writeResult(c, result, false, streamProtocolResponses)
 				}
@@ -1664,7 +1664,7 @@ func TestWriteProtocolResultMapsJSONInvalidArgumentWithoutCopyStream(t *testing.
 	}
 	router := gin.New()
 	router.GET("/", func(c *gin.Context) {
-		handler.writeResponsesResult(c, result, true, "")
+		handler.writeProtocolResult(c, result, true, false, streamProtocolResponses, "")
 	})
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -1691,7 +1691,7 @@ func TestWriteProtocolResultAnthropicJSONReadFailureKeepsAnthropicShape(t *testi
 	}
 	router := gin.New()
 	router.GET("/", func(c *gin.Context) {
-		handler.writeAnthropicResult(c, result, true)
+		handler.writeProtocolResult(c, result, true, true, streamProtocolAnthropic, "")
 	})
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -1727,7 +1727,7 @@ func TestWriteProtocolResultDoesNotRemapOtherJSON4xxAsServerError(t *testing.T) 
 	}
 	router := gin.New()
 	router.GET("/", func(c *gin.Context) {
-		handler.writeResponsesResult(c, result, true, "")
+		handler.writeProtocolResult(c, result, true, false, streamProtocolResponses, "")
 	})
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
