@@ -1,6 +1,6 @@
 # us2 部署
 
-更新日期：2026-10-08。目标服务器 `us2`，项目目录 `/opt/docker_projects/grok2api`，Compose 项目名 `grok2api-official`。
+更新日期：2026-10-21。目标服务器 `us2`，项目目录 `/opt/docker_projects/grok2api`，Compose 项目名 `grok2api-official`。
 
 - 配置检查：`scripts/deploy-grok2api-official.sh config -q`
 - 状态查询：`scripts/deploy-grok2api-official.sh ps`
@@ -20,13 +20,13 @@
 
 ## 发布与验证
 
-本次同步上游 `7c889a960e2638341b4dae9a5c81af0e0f38c87f`，修复动态 Build 能力污染其他 Provider 以及分段 SSE 首片段被误判为快速倾倒。
+本次仅在 `dev` 同步上游 `e03cacb9d142e16d5a419fbf40efbd8f1b0cc819`，保留动态 Build 能力的 Provider 隔离及分段 SSE 首片段误判修复。补齐 consent_token 自闭合 input 解析；同步视频重试账号范围、Imagine 请求隔离、语音超时及计费、账号绑定查询和瞬时重试标记等改动。`main` 保持不变。
 
-构建使用现有官方镜像的固定 digest、Go 1.26.4 构建的 Linux amd64 二进制及 `pnpm build` 产出的前端。镜像记录源代码树 ID、基础上游提交和源码归档 SHA-256；发布记录将最终 Git 提交的 tree 与镜像 tree 核对。
+镜像在本地构建为 Linux amd64，固定运行基础镜像，打包交叉编译的 Go 二进制及 `pnpm build` 产出的前端。镜像记录源代码树 ID、基础上游提交和源码归档 SHA-256；发布记录将最终 Git 提交的 tree 与镜像 tree 核对。
 
-已有运行设置会覆盖源码默认值，因此发布将持久设置中原默认 `1.0.4` / `grok-shell/1.0.4 (linux; x86_64)` 更新为 `1.0.40` 对应值，保留其他字段。备份包含旧设置，回滚只恢复这两个字段。
+已有运行设置会覆盖源码默认值。本次保留生产设置及质量守护策略，不自动开启新增的降质账号停用功能；Build 客户端版本以运行配置和业务验证结果为准，不因源码推荐值更新而覆盖持久设置。
 
-服务器恢复材料及实际检查记录保存在 `backups/20261008-upstream/`，目录权限 `0700`；配置和 SQLite 原生一致性备份权限 `0600`。保留原镜像，不自动清理。
+服务器恢复材料和检查记录保存在项目目录外 `/opt/backups/grok2api-20261021-upstream/`，目录权限 `0700`；配置和 SQLite 原生一致性备份权限 `0600`。保留上一版本镜像。回滚只恢复本次改变的 Compose 镜像，不用发布前整库覆盖后续业务写入。
 
 验收包含后端测试、前端构建与测试、部署前后 API 认证边界和真实 Build/Web/Console SSE、公共 TLS 页面及静态资源、数据库完整性、挂载身份和其他容器 ID/StartedAt/RestartCount。上游失败与程序回归分别记录；健康状态不代替推理成功。
 
