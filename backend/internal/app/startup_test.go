@@ -18,7 +18,7 @@ import (
 func TestReadinessStartupReportDoesNotExposeInternalErrors(t *testing.T) {
 	state := newStartupState(0)
 	state.recordError(errors.New("postgres://private-host/internal"))
-	_, _, report, _ := state.snapshot()
+	_, _, report, _, _ := state.snapshot()
 	payload, err := json.Marshal(newReadinessStartupReport(report))
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +67,62 @@ func TestReadinessKeepsBuildReadyWhenWebIsUnavailable(t *testing.T) {
 	}
 	if snapshot.Components["grok_build"].State != "ready" || snapshot.Components["grok_web"].State != "unavailable" {
 		t.Fatalf("components = %#v", snapshot.Components)
+	}
+}
+
+func TestReadinessSeparatesLegacyStatsigFromCurrentWebProtocol(t *testing.T) {
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), "readiness-web-protocol.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	accounts := relational.NewAccountRepository(database)
+	models := relational.NewModelRepository(database)
+	now := time.Now().UTC()
+	build, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderBuild, Name: "build-ready", SourceKey: "build-ready",
+		EncryptedAccessToken: "build-access", Enabled: true, AuthStatus: accountdomain.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	web, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, Name: "web-ready", SourceKey: "web-ready",
+		EncryptedAccessToken: "web-access", UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca",
+		Enabled: true, AuthStatus: accountdomain.AuthStatusActive, MaxConcurrent: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := models.UpsertRoutes(ctx, []modeldomain.Route{
+		{PublicID: "build-model", Provider: accountdomain.ProviderBuild, UpstreamModel: "build-model", Capability: modeldomain.CapabilityResponses, Enabled: true, SupportedAccounts: 1},
+		{PublicID: "web-model", Provider: accountdomain.ProviderWeb, UpstreamModel: "web-model", Capability: modeldomain.CapabilityChat, Enabled: true, SupportedAccounts: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, build.ID, []string{"build-model"}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := models.ReplaceAccountCapabilities(ctx, web.ID, []string{"web-model"}, now); err != nil {
+		t.Fatal(err)
+	}
+	state := newStartupState(0)
+	state.setPhase("running")
+	state.setStatsig("unavailable", "旧 Statsig 元数据缺失", 0)
+	state.setWeb("ready", "当前浏览器 Gateway 握手已验证", 1)
+	snapshot := readinessSnapshot(ctx, state, func(context.Context) error { return nil }, models, accounts, provider.NewRegistry(), nil)
+	if !snapshot.Ready || snapshot.State != "degraded" {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	if snapshot.Components["grok_web"].State != "ready" || snapshot.Components["grok_web_protocol"].State != "ready" {
+		t.Fatalf("web components = %#v", snapshot.Components)
+	}
+	if snapshot.Components["statsig"].State != "unavailable" || snapshot.Startup.WebProtocolWarmed != 1 {
+		t.Fatalf("legacy statsig should remain visible: %#v", snapshot)
 	}
 }
 

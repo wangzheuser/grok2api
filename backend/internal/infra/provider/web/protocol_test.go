@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	fhttptest "github.com/bogdanfinn/fhttp/httptest"
@@ -610,6 +611,59 @@ func TestOpenChatScopesStreamIdleTimeoutToTextStreams(t *testing.T) {
 		}
 		_ = upstream.Body.Close()
 		lease.Release()
+	}
+}
+
+func TestWarmWebUsesGatewayHandshakeWithoutSendingTurn(t *testing.T) {
+	var receivedTurn bool
+	server := fhttptest.NewServer(fhttp.HandlerFunc(func(writer fhttp.ResponseWriter, request *fhttp.Request) {
+		if request.URL.Path != "/ws/mgw/" {
+			fhttp.NotFound(writer, request)
+			return
+		}
+		connection, err := (&websocket.Upgrader{CheckOrigin: func(*fhttp.Request) bool { return true }}).Upgrade(writer, request, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer connection.Close()
+		var initial map[string]any
+		if err := connection.ReadJSON(&initial); err != nil {
+			t.Errorf("read session.create: %v", err)
+			return
+		}
+		event := initial["event"].(map[string]any)
+		eventID := event["event_id"].(string)
+		if event["type"] != "session.create" {
+			t.Errorf("event type = %#v", event["type"])
+		}
+		_ = connection.WriteJSON(map[string]any{"session_id": "warm-session", "event": map[string]any{"type": "session.created", "client_event_id": eventID}})
+		_ = connection.WriteJSON(map[string]any{"session_id": "warm-session", "event": map[string]any{"type": "conversation.attached", "conversation": map[string]any{"id": "warm-conversation"}}})
+		_ = connection.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		if _, _, readErr := connection.ReadMessage(); readErr == nil {
+			receivedTurn = true
+		}
+	}))
+	defer server.Close()
+
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("test-sso")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := NewAdapter(Config{BaseURL: server.URL}, infraegress.NewManager(egressRepositoryStub{}, cipher), cipher, nil, nil)
+	credential := account.Credential{
+		ID: 1, Provider: account.ProviderWeb, UserID: "497f19f8-49d4-458a-bee4-43ec3dcaf8ca",
+		EncryptedAccessToken: encrypted,
+	}
+	if err := adapter.WarmWeb(context.Background(), credential); err != nil {
+		t.Fatal(err)
+	}
+	if receivedTurn {
+		t.Fatal("warmup sent a conversation turn")
 	}
 }
 

@@ -155,6 +155,79 @@ func (a *Adapter) openGatewayChat(ctx context.Context, credential account.Creden
 	}, lease, previous, "", nil
 }
 
+// WarmWeb verifies the current browser Gateway handshake without creating a
+// conversation turn or consuming model quota.
+func (a *Adapter) WarmWeb(ctx context.Context, credential account.Credential) error {
+	cfg := a.config()
+	token, err := a.cipher.Decrypt(credential.EncryptedAccessToken)
+	if err != nil {
+		return err
+	}
+	lease, err := a.egress.AcquireCredential(ctx, domainegress.ScopeWeb, credential)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+
+	userID, err := a.resolveGatewayUserID(ctx, cfg.BaseURL, credential, token, lease)
+	if err != nil {
+		return err
+	}
+	endpoint, origin, err := gatewayEndpoint(cfg.BaseURL, userID)
+	if err != nil {
+		return err
+	}
+	connection, response, err := lease.DialWebSocket(ctx, endpoint, gatewayHeaders(origin, userID, token, lease), gatewayHandshakeTimeout)
+	if err != nil {
+		if response != nil {
+			return fmt.Errorf("Grok Web Gateway 握手返回 %d", response.StatusCode)
+		}
+		return err
+	}
+	defer connection.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = connection.SetReadDeadline(deadline)
+	}
+	eventID := "evt_warm_" + newRequestUUID()
+	if err := connection.WriteJSON(map[string]any{
+		"event": map[string]any{
+			"type": "session.create", "event_id": eventID,
+			"session": gatewaySession("grok-chat-fast", nil),
+		},
+	}); err != nil {
+		return fmt.Errorf("发送 Grok Gateway 预热握手: %w", err)
+	}
+
+	created, attached := false, false
+	for {
+		messageType, data, readErr := connection.ReadMessage()
+		if readErr != nil {
+			return fmt.Errorf("读取 Grok Gateway 预热握手: %w", readErr)
+		}
+		if messageType != websocket.TextMessage {
+			continue
+		}
+		var envelope gatewayEnvelope
+		if json.Unmarshal(data, &envelope) != nil {
+			continue
+		}
+		switch envelope.Event.Type {
+		case "session.created":
+			if envelope.Event.ClientEventID == "" || envelope.Event.ClientEventID == eventID {
+				created = true
+			}
+		case "conversation.attached":
+			attached = envelope.Event.Conversation.ID != ""
+		case "error":
+			return gatewayEventError(map[string]any{"type": "error", "error": map[string]any{"message": "Gateway 预热返回错误"}})
+		}
+		if created && attached {
+			return nil
+		}
+	}
+}
+
 func (a *Adapter) resolveGatewayUserID(ctx context.Context, baseURL string, credential account.Credential, token string, lease *infraegress.Lease) (string, error) {
 	if userID, err := normalizeGatewayUserID(credential.UserID); err == nil {
 		return userID, nil

@@ -90,6 +90,7 @@ type ReadinessStartupReport struct {
 	QuotaRecoveriesRestored  int                       `json:"quotaRecoveriesRestored"`
 	DueWebQuotasQueued       int                       `json:"dueWebQuotasQueued"`
 	StatsigKeysWarmed        int                       `json:"statsigKeysWarmed"`
+	WebProtocolWarmed        int                       `json:"webProtocolWarmed"`
 	StaleWebQuotasFound      int                       `json:"staleWebQuotasFound"`
 	StaleWebQuotasSynced     int                       `json:"staleWebQuotasSynced"`
 	StaleModelCatalogsFound  int                       `json:"staleModelCatalogsFound"`

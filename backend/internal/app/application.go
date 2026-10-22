@@ -631,8 +631,8 @@ func (a *Application) Run(ctx context.Context) error {
 		a.accounts.RunAccountAutoClean(taskCtx)
 		return nil
 	})
-	startBackground("statsig_warmup", func(taskCtx context.Context) error {
-		a.runStatsigWarmup(taskCtx)
+	startBackground("web_warmup", func(taskCtx context.Context) error {
+		a.runWebWarmup(taskCtx)
 		return nil
 	})
 	startBackground("web_quota_startup_catchup", func(taskCtx context.Context) error {

@@ -40,6 +40,7 @@ type startupReport struct {
 	QuotaRecoveriesRestored  int
 	DueWebQuotasQueued       int
 	StatsigKeysWarmed        int
+	WebProtocolWarmed        int
 	StaleWebQuotasFound      int
 	StaleWebQuotasSynced     int
 	StaleModelCatalogsFound  int
@@ -53,6 +54,7 @@ type startupState struct {
 	updatedAt time.Time
 	report    startupReport
 	statsig   httpserver.ReadinessComponent
+	web       httpserver.ReadinessComponent
 }
 
 func newStartupState(restoredQuotaRecoveries int) *startupState {
@@ -65,6 +67,7 @@ func newStartupState(restoredQuotaRecoveries int) *startupState {
 			QuotaRecoveriesRestored: restoredQuotaRecoveries,
 		},
 		statsig: httpserver.ReadinessComponent{State: "cold"},
+		web:     httpserver.ReadinessComponent{State: "cold"},
 	}
 }
 
@@ -105,10 +108,20 @@ func (s *startupState) setStatsig(state, detail string, warmed int) {
 	s.mu.Unlock()
 }
 
-func (s *startupState) snapshot() (string, time.Time, startupReport, httpserver.ReadinessComponent) {
+func (s *startupState) setWeb(state, detail string, warmed int) {
+	s.mu.Lock()
+	s.web = httpserver.ReadinessComponent{State: state, Detail: detail}
+	if warmed > 0 {
+		s.report.WebProtocolWarmed = warmed
+	}
+	s.updatedAt = time.Now().UTC()
+	s.mu.Unlock()
+}
+
+func (s *startupState) snapshot() (string, time.Time, startupReport, httpserver.ReadinessComponent, httpserver.ReadinessComponent) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.phase, s.updatedAt, s.report, s.statsig
+	return s.phase, s.updatedAt, s.report, s.statsig, s.web
 }
 
 func (s *startupState) acceptsTraffic() bool {
@@ -126,15 +139,16 @@ func readinessSnapshot(
 	providers *provider.Registry,
 	ledger *auditapp.Service,
 ) httpserver.ReadinessSnapshot {
-	phase, updatedAt, report, statsig := state.snapshot()
+	phase, updatedAt, report, statsig, web := state.snapshot()
 	snapshot := httpserver.ReadinessSnapshot{
 		Ready: false, State: phase, UpdatedAt: updatedAt, Startup: newReadinessStartupReport(report),
 		Components: map[string]httpserver.ReadinessComponent{
-			"runtime_store":  {State: "unknown"},
-			"billing_ledger": {State: "unknown"},
-			"grok_build":     {State: "unknown"},
-			"grok_web":       {State: "unknown"},
-			"statsig":        statsig,
+			"runtime_store":     {State: "unknown"},
+			"billing_ledger":    {State: "unknown"},
+			"grok_build":        {State: "unknown"},
+			"grok_web":          {State: "unknown"},
+			"grok_web_protocol": web,
+			"statsig":           statsig,
 		},
 	}
 	if phase != "running" {
@@ -262,15 +276,19 @@ func readinessSnapshot(
 		}
 		snapshot.Components[name] = httpserver.ReadinessComponent{State: "unavailable", Detail: detail}
 	}
-	if required[accountdomain.ProviderWeb] && usable[accountdomain.ProviderWeb] && statsig.State != "warm" {
+	if required[accountdomain.ProviderWeb] && usable[accountdomain.ProviderWeb] && web.State != "ready" {
 		component := snapshot.Components[string(accountdomain.ProviderWeb)]
-		if statsig.State == "warming" || statsig.State == "cold" {
+		if web.State == "warming" || web.State == "cold" {
 			component.State = "warming"
 		} else {
 			component.State = "degraded"
 		}
-		component.Detail = "Statsig 尚未完成预热；请求仍可按需刷新"
+		component.Detail = "当前浏览器 Gateway 预热未完成；请求仍可按需刷新"
 		snapshot.Components[string(accountdomain.ProviderWeb)] = component
+		unavailableProviders++
+	}
+	if required[accountdomain.ProviderWeb] && statsig.State == "unavailable" {
+		// 旧签名链路仍公开为独立降级项，不改变当前 Gateway 的可用性。
 		unavailableProviders++
 	}
 	if readyProviders == 0 {
@@ -301,6 +319,7 @@ func newReadinessStartupReport(report startupReport) *httpserver.ReadinessStartu
 		QuotaRecoveriesRestored:  report.QuotaRecoveriesRestored,
 		DueWebQuotasQueued:       report.DueWebQuotasQueued,
 		StatsigKeysWarmed:        report.StatsigKeysWarmed,
+		WebProtocolWarmed:        report.WebProtocolWarmed,
 		StaleWebQuotasFound:      report.StaleWebQuotasFound,
 		StaleWebQuotasSynced:     report.StaleWebQuotasSynced,
 		StaleModelCatalogsFound:  report.StaleModelCatalogsFound,
@@ -381,7 +400,7 @@ func (a *Application) reconcileStartup(ctx context.Context) {
 	a.logger.Info("startup_reconciliation_completed", "credentials_backfilled", report.SchedulesBackfilled, "critical_found", report.CriticalFound, "credentials_refreshed", report.Refreshed, "credentials_failed", report.Failed)
 }
 
-func (a *Application) runStatsigWarmup(ctx context.Context) {
+func (a *Application) runWebWarmup(ctx context.Context) {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
@@ -390,26 +409,40 @@ func (a *Application) runStatsigWarmup(ctx context.Context) {
 			return
 		case <-timer.C:
 		}
-		a.startup.setStatsig("warming", "正在预热共享签名", 0)
-		values, err := a.accountRepo.ListEnabled(ctx, accountdomain.ProviderWeb)
-		if err == nil && len(values) == 0 {
+		a.startup.setWeb("warming", "正在预热当前浏览器 Gateway", 0)
+		a.startup.setStatsig("warming", "正在检查旧 Statsig 签名", 0)
+		values, listErr := a.accountRepo.ListEnabled(ctx, accountdomain.ProviderWeb)
+		if listErr == nil && len(values) == 0 {
+			a.startup.setWeb("disabled", "没有启用的 Grok Web 账号", 0)
 			a.startup.setStatsig("disabled", "没有启用的 Grok Web 账号", 0)
-		} else if err == nil {
-			warmCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			var warmed int
-			warmed, err = a.web.WarmStatsig(warmCtx, values[0])
-			cancel()
-			if err == nil {
-				a.startup.setStatsig("warm", "共享签名已预热", warmed)
+		} else if listErr == nil {
+			webCtx, webCancel := context.WithTimeout(ctx, 30*time.Second)
+			webErr := a.web.WarmWeb(webCtx, values[0])
+			webCancel()
+			if webErr == nil {
+				a.startup.setWeb("ready", "当前浏览器 Gateway 握手已验证", 1)
+			} else if ctx.Err() == nil {
+				a.logger.Warn("web_protocol_warmup_failed", "error", webErr)
+				a.startup.setWeb("unavailable", "当前浏览器 Gateway 握手失败；请求仍可按需重试", 0)
 			}
-		}
-		if err != nil && ctx.Err() == nil {
-			a.logger.Warn("web_statsig_warmup_failed", "error", err)
-			detail := "预热失败，将由请求按需重试"
-			if errors.Is(err, webprovider.ErrStatsigMetaMissing) {
-				detail = "上游页面缺少 grok-site-verification；5 分钟内跳过重复抓取，未生成签名"
+
+			statsigCtx, statsigCancel := context.WithTimeout(ctx, 30*time.Second)
+			warmed, statsigErr := a.web.WarmStatsig(statsigCtx, values[0])
+			statsigCancel()
+			if statsigErr == nil {
+				a.startup.setStatsig("warm", "旧 Statsig 签名已预热", warmed)
+			} else if ctx.Err() == nil {
+				a.logger.Warn("web_statsig_warmup_failed", "error", statsigErr)
+				detail := "旧 Statsig 预热失败；当前 Web 协议不依赖该签名"
+				if errors.Is(statsigErr, webprovider.ErrStatsigMetaMissing) {
+					detail = "旧 Statsig 元数据缺失；当前 Web 协议不依赖该签名"
+				}
+				a.startup.setStatsig("unavailable", detail, 0)
 			}
-			a.startup.setStatsig("unavailable", detail, 0)
+		} else if ctx.Err() == nil {
+			a.logger.Warn("web_protocol_warmup_failed", "error", listErr)
+			a.startup.setWeb("unavailable", "Grok Web 账号状态读取失败", 0)
+			a.startup.setStatsig("unavailable", "Grok Web 账号状态读取失败", 0)
 		}
 		resetTimer(timer, statsigWarmupInterval)
 	}
